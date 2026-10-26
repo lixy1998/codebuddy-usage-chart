@@ -130,7 +130,13 @@ codebuddy-usage-chart/
 https://raw.githubusercontent.com/lixy1998/codebuddy-usage-chart/main/codebuddy-usage-chart.user.js
 ```
 
-**首次安装**：把上面地址粘进浏览器打开（Tampermonkey 会接管并弹出安装页）；或本地打开 `codebuddy-usage-chart.user.js` 拖进浏览器。
+**首次安装**（推荐点这个链接，Tampermonkey 会自动接管）：
+
+```
+https://github.com/lixy1998/codebuddy-usage-chart/raw/main/codebuddy-usage-chart.user.js
+```
+
+也可以把上面的 raw 地址粘进浏览器地址栏，或本地打开 `codebuddy-usage-chart.user.js` 拖进浏览器。
 
 **更新**：Tampermonkey 会按 `@updateURL` 定期检查 `@version`，也可以在脚本的「设置 → 检查更新」手动拉。之后要发新版，只做两步：
 
