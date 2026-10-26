@@ -1,0 +1,150 @@
+# CodeBuddy / WorkBuddy 用量图表脚本 v0.6.0
+
+在 CodeBuddy 与 WorkBuddy（个人版 / 企业版）的用量页面上，于明细表格上方插入积分消耗柱状图。
+
+- 仓库：https://github.com/lixy1998/codebuddy-usage-chart
+- 安装 / 更新源：`https://raw.githubusercontent.com/lixy1998/codebuddy-usage-chart/main/codebuddy-usage-chart.user.js`
+- 协议：MIT
+
+## 目录
+
+```
+codebuddy-usage-chart/
+├─ codebuddy-usage-chart.user.js   ← 交付物（构建产物，直接装进 Tampermonkey）
+├─ src/core.js                     ← 纯函数层：解析、区间口径、校准、分桶（可单测）
+├─ src/main.js                     ← 页面层：DOM 适配、数据源、渲染、交互
+├─ build.mjs                       ← 零依赖构建：core + main → 单文件
+├─ test/core.test.mjs              ← 纯函数单测（node:test，21 例）
+├─ package.json                    ← 只为让 node 把 src/*.js 当 ESM，无任何依赖
+└─ LICENSE                         ← MIT
+```
+
+**改代码请改 `src/` 下的文件，然后 `node build.mjs`**；直接改 `.user.js` 会在下次构建时被覆盖。
+
+| 命令 | 作用 |
+| --- | --- |
+| `node build.mjs` | 构建（沿用当前 `@version`） |
+| `node build.mjs --version=0.6.1` | 构建并改版本号 |
+| `node build.mjs --check` | 校验产物与源码是否一致（提交前用） |
+| `node --test test/core.test.mjs` | 跑纯函数单测 |
+
+## 一、适配矩阵
+
+| 站点 | 页面 | 适配器 | 主题 | 数据来源 |
+| --- | --- | --- | --- | --- |
+| codebuddy.cn | `/profile/plans-usage` | `plans` | 深色（紫 #724bff） | bridge 捕获 + 表格 + 分页补齐 |
+| workbuddy.cn | `/profile/plans-usage` | `plans` | 浅色（薄荷绿 #4ecba0） | 同上 |
+| workbuddy.cn | `/profile/usage`（企业版） | `enterprise` | 浅色（跟随页面卡片变量） | `get-user-daily-usage` + `get-user-request-usage` |
+
+企业版是 React + TDesign 的另一套应用（类名 `usage-request-table`，不是个人版的 `request-usage-table--plans-usage`），所以用独立适配器 + 接口取数。
+
+## 二、企业版取数与校准
+
+两个接口并行请求：
+
+- `POST /billing/meter/get-user-daily-usage`：按天汇总，页面表格的数据源，有 2–3 小时延迟但完整
+- `POST /billing/meter/get-user-request-usage`：请求明细，含 `model` / `requestTime` / `credit`，游标分页
+
+明细直接求和会明显低于页面汇总（实测 512 vs 645）。因此**按天以汇总值为准，把当天明细的（时段 × 模型）分布等比缩放到汇总值**：柱高总和与页面「每日用量」对账一致，模型占比与小时分布仍来自真实明细。
+
+游标分页两个坑：`total` 是**本页条数**而非总数（完整性只认 `nextPageToken`）；`pageSize: 500` 会被服务端截断并提前关游标（119 条只回 103 条），故固定 100 逐页跟随。
+
+## 三、区间口径：平台把「N 天」算成了 N+1 天
+
+「选 7 天、图上 8 根柱」不是脚本算错，是平台取的区间就多一天。取证（页面自身发出的请求体，两站一致）：
+
+| 档位 | startTime | endTime | 自然日 |
+| --- | --- | --- | --- |
+| 企业版 3d | 2026-10-23 | 2026-10-26 | **4** |
+| 企业版 7d | 2026-10-19 | 2026-10-26 | **8** |
+| 企业版 30d | 2026-09-26 | 2026-10-26 | **31** |
+| 个人版 7天 | 2026-10-19 | 2026-10-26 | **8** |
+| 个人版 今天 | 2026-10-26 | 2026-10-26 | 1（正常） |
+
+规律是 `start = 今天 − N`，应为 `今天 − (N−1)`。图表侧处置（`ALIGN_RANGE_TO_LABEL = true`）：识别到「跨度 = 档位天数 + 1 且终点是今天」时按标签口径截齐，并在右上角标注「平台7天档实为8天，已按7天截取」；手动挑选的日期区间不裁剪。想让图表与下方表格逐日对账，把该常量改 `false`。
+
+## 四、v0.6.0 数据层优化
+
+1. **接口缓存 60s TTL + 后台刷新**：切回同一区间先渲染旧数据、同时后台换新，不再闪「加载中」，也不再长期看陈旧值。实测：60s 内重复触发 0 请求，过期后重新拉取（daily 1 + 明细 2 页）。
+2. **校准可信度判定与降级**：等比缩放的前提是「明细基本覆盖当天」。若某天明细占汇总的比例 < 50%（刚过零点、分页失败、接口抽风），硬缩放会把整天消耗塞进那几小时 —— 这种天降级为「整日一条」，并标注「明细覆盖不足，N 天按汇总直取」。
+3. **失败冷却与退避重试**：网络错误 / 429 / 5xx 退避重试 2 次（400ms → 1200ms）；失败后 30s 内不重复打接口，先用表格已渲染的行兜底；业务错误（`code != 0`）不重试。
+4. **空值不再被当成 0**：`parseNumber("")` 原本返回 `0`（`Number("") === 0`），会让空白行混进记录池、把「没数据」算成「消耗 0」。已修正为 `NaN`——这个缺陷是新增单测抓出来的。
+5. **桶数自适应降采样**：按小时画超宽区间时，桶数超过 240 自动退回按天，避免上千个 SVG 节点卡顿。
+6. **补数页大小提升**：个人版补数从 `pageSize: 10` 提到 100（接口实测 10/50/100 均 200 OK），7 天档 26 页→3 页、30 天档 114 页→12 页。注意页码语义随之改变，必须从第 1 页重取并把 `pageSize` 一并写回请求体，否则会漏掉「原第 1 页～新第 2 页」整段。
+
+## 五、v0.6.0 工程层优化
+
+1. **拆成三层、零依赖构建**：纯函数进 `core.js`（不碰 DOM 与全局状态），页面逻辑留 `main.js`，`build.mjs` 只做「剥离 export + 拼接 + 套 IIFE」。不引入打包器是有意的：产物必须是能直接贴进 Tampermonkey 的单文件，而源码要能被 node 直接 `import`。
+2. **纯函数单测 21 例**：覆盖时区解析（固定 UTC+8）、区间截齐 6 种情形、日/小时分桶边界、校准（总额对账、模型占比、覆盖不足降级）、粒度降级、记录归一化、payload 抽取、期望条数折算。此前三处严重缺陷（列序、tooltip 缩放、校准日期字段）都落在纯函数边界上，这一步就是补那条防线。
+3. **调试开关**：控制台执行 `__CBUC_DEBUG = true`（或 `localStorage.cbuc_debug = "1"` 后刷新）即打印区间解析、数据源选择、接口耗时、明细页数、校准统计、粒度降级等中间态。
+4. **网络钩子改为直连**：`@grant none` 时脚本本就跑在页面上下文，直接打补丁即可；严格 CSP 站点会拦掉原来的内联 `<script>` 注入。仅在检测到沙箱迹象（存在 `unsafeWindow`）时才回退注入。
+5. **指纹计算轻量化**：每次 DOM 变动都会重算 UI 指纹，改用字符串拼接替代 `JSON.stringify`。
+6. **构建一致性校验**：`node build.mjs --check` 可在提交前发现「改了 src 忘了构建」。
+
+## 六、v0.5.0 修复清单（相对 v0.4.0）
+
+1. **企业版不显示**：只认 `.request-usage-table--plans-usage`，返回 null 后整卡不挂载 → 改为多适配器自动探测。
+2. **CodeBuddy 积分解析成天文数字**：页面改版后列序变为 `时间/请求摘要/积分消耗/模型/使用端`，旧代码硬编码 `cells[1]` → 改为按内容特征定位列。
+3. **tooltip 垂直错位**：用 `scaleX` 换算 y（viewBox 与显示尺寸不等比时必错）→ 改 `scaleY`。
+4. **tooltip 溢出被裁**：定位参照系算 canvas、实际相对 root 定位，且先测量后填内容 → 改为先填内容再按 root 坐标系测量。
+5. **完整性误判**：企业版分页文案是「当前页 10 条」，旧正则 `共 N 条` 会误读。
+6. **重复处理**：React 双请求推送两次，加 payload 指纹去抖。
+7. **补数请求被自己的 bridge 二次解析**：加 `x-cbuc-hydrate` 头，bridge 跳过。
+8. **观察器自触发**：图表自身 DOM 变动会再触发同步，改为过滤自身节点。
+9. **跨时区错位**：`new Date("2026-10-26 21:02:59")` 按本机时区解释 → 固定 UTC+8。
+10. **内存增长**：记录池与接口缓存加上限。
+11. **性能**：`Intl.NumberFormat` 复用、主题色按次渲染缓存、SVG `defs` 改用 DOM API。
+12. **语义与本地化**：企业版用「积分」术语，CodeBuddy 用 Credit；数据来源分「汇总校准 / 明细聚合 / 按天汇总」标注。
+
+## 七、仍可优化的方向
+
+**数据**
+
+- 校准是「按天等比缩放」，天内的时段分布仍取自明细。若明细恰好覆盖 50%–80%（刚过阈值），分布仍是近似的，只是退化得不明显。
+- 企业版页面自身请求已被 bridge 捕获，理论上可复用、省掉一次主动拉取；当前仍以主动拉取为准（更可靠），捕获结果只作兜底。
+- 30 天档需 12 页明细；若接口进一步限流，可考虑只拉近 N 天明细 + 更早的按天汇总拼接。
+
+**交互（本轮未做）**
+
+- 柱/折线/累积切换、日均与环比摘要、点柱下钻明细、键盘可达与屏幕阅读器表格化 fallback、窄屏刻度压缩。
+
+**工程**
+
+- 单测只覆盖 core；`main.js` 的适配器依赖真实 DOM，仍靠实机回归，可考虑加 Playwright 快照。
+- `pageBridge` 是字符串注入的函数（`toString`），无法单测；若站点都支持 `unsafeWindow`，可改为普通模块函数。
+
+## 八、自测记录（2026-10-26，工作机 Chrome/Edge 实机）
+
+- 企业版 7d：**7 根柱（10-20 ~ 10-26）**，总量与「每日用量」逐日对账一致，标注平台多算一天。
+- 企业版 3d：**3 天按小时，72 桶**；30d：**30 桶**。
+- 企业版「按模型划分」：堆叠 + 模型图例（首位用品牌色）；tooltip 显示日期/总量/模型/占比，不溢出。
+- 个人版 7天：**7 根柱**，列序变化后积分解析正确（10 条已加载记录合计 9.71）。
+- 缓存 TTL：60s 内重复触发 0 请求；过期后重新拉取（daily 1 + 明细 2 页），期间页面不闪加载态。
+- 单测 21/21 通过；`node build.mjs --check` 产物与源码一致。
+
+## 九、安装 / 更新
+
+脚本头部的 `@downloadURL` / `@updateURL` 已指向 GitHub：
+
+```
+https://raw.githubusercontent.com/lixy1998/codebuddy-usage-chart/main/codebuddy-usage-chart.user.js
+```
+
+**首次安装**：把上面地址粘进浏览器打开（Tampermonkey 会接管并弹出安装页）；或本地打开 `codebuddy-usage-chart.user.js` 拖进浏览器。
+
+**更新**：Tampermonkey 会按 `@updateURL` 定期检查 `@version`，也可以在脚本的「设置 → 检查更新」手动拉。之后要发新版，只做两步：
+
+```bash
+node build.mjs --version=0.6.1   # 改版本号并构建（版本必须递增，否则不会被识别为更新）
+git commit -am "release v0.6.1" && git push
+```
+
+**国内网络拉不动 raw 时**：两个办法任选——① 浏览器/代理放行 `raw.githubusercontent.com`；② 把 `build.mjs` 里的两个 URL 换成 jsDelivr 镜像后重新构建：
+
+```
+https://cdn.jsdelivr.net/gh/lixy1998/codebuddy-usage-chart@main/codebuddy-usage-chart.user.js
+```
+
+注意 jsDelivr 对 `@main` 有约 12 小时缓存，发版后不会立刻生效（急用可临时切 raw）。
+
+**本地已装旧版（greasyfork 的 0.4.0）**：直接覆盖安装本仓库版本即可；若企业版卡片仍不出现，禁用再启用一次脚本以清掉旧实例。

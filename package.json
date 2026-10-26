@@ -1,0 +1,10 @@
+{
+  "name": "codebuddy-usage-chart",
+  "private": true,
+  "type": "module",
+  "description": "CodeBuddy / WorkBuddy 用量图表油猴脚本（零依赖源码，build.mjs 产出单文件）",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/core.test.mjs"
+  }
+}
