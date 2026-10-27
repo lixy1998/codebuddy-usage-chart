@@ -27,6 +27,9 @@ import {
   resolveGranularity,
   bucketizeRecords,
   getExpectedCount,
+  resolvePersonalTodayRangeKey,
+  presetDateRange,
+  rewriteTodayRequestRange,
   DAY_MS,
 } from "../src/core.js";
 
@@ -86,6 +89,55 @@ test("档位决定聚合粒度", () => {
   assert.equal(determineUnit("3d"), "hour");
   assert.equal(determineUnit("7d"), "day");
   assert.equal(determineUnit("30d"), "day");
+});
+
+test("个人版「今天」档改成近3天：只改 today，其余档位原样", () => {
+  assert.equal(resolvePersonalTodayRangeKey("today"), "3d");
+  assert.equal(resolvePersonalTodayRangeKey("7d"), "7d");
+  assert.equal(resolvePersonalTodayRangeKey("30d"), "30d");
+  assert.equal(resolvePersonalTodayRangeKey(""), "");
+  // 关掉改造（days <= 1）后回到平台原义
+  assert.equal(resolvePersonalTodayRangeKey("today", 1), "today");
+  assert.equal(resolvePersonalTodayRangeKey("today", 0), "today");
+});
+
+test("按档位推算区间：含今天共 N 天", () => {
+  const d3 = presetDateRange("3d", NOW);
+  assert.deepEqual(d3, { startDate: "2026-10-24", endDate: "2026-10-26" });
+  const d7 = presetDateRange("7d", NOW);
+  assert.deepEqual(d7, { startDate: "2026-10-20", endDate: "2026-10-26" });
+  assert.deepEqual(presetDateRange("", NOW), { startDate: "", endDate: "" });
+});
+
+test("请求体改写：只把「今天单日」的 startTime 前移，其它字段原样", () => {
+  const body = JSON.stringify({
+    startTime: "2026-10-26 00:00:00",
+    endTime: "2026-10-26 23:59:59",
+    pageNum: 1,
+    pageSize: 10,
+  });
+  const out = JSON.parse(rewriteTodayRequestRange(body, NOW));
+  assert.equal(out.startTime, "2026-10-24 00:00:00");
+  assert.equal(out.endTime, "2026-10-26 23:59:59");
+  assert.equal(out.pageNum, 1);
+  assert.equal(out.pageSize, 10);
+
+  // 7 天档（平台给 8 天）不命中
+  const week = JSON.stringify({
+    startTime: "2026-10-19 00:00:00",
+    endTime: "2026-10-26 23:59:59",
+  });
+  assert.equal(rewriteTodayRequestRange(week, NOW), null);
+  // 非今天的历史区间不命中
+  const past = JSON.stringify({
+    startTime: "2026-10-01 00:00:00",
+    endTime: "2026-10-01 23:59:59",
+  });
+  assert.equal(rewriteTodayRequestRange(past, NOW), null);
+  // 非 JSON / 空 / 关闭改造
+  assert.equal(rewriteTodayRequestRange("pageNum=1", NOW), null);
+  assert.equal(rewriteTodayRequestRange("", NOW), null);
+  assert.equal(rewriteTodayRequestRange(body, NOW, 1), null);
 });
 
 test("signature 往返稳定", () => {

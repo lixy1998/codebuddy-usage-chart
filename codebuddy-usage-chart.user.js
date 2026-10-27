@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CodeBuddy / WorkBuddy Usage Credit Chart
 // @namespace    https://github.com/lixy1998/codebuddy-usage-chart
-// @version      0.6.0
+// @version      0.7.0
 // @description  Add a credit usage chart above the usage tables of CodeBuddy / WorkBuddy (personal & enterprise).
 // @license      MIT
 // @author       lixy1998
@@ -36,6 +36,17 @@
   const RANGE_LABEL_DAYS = { today: 1, "3d": 3, "7d": 7, "30d": 30 };
   // 补数页数安全阀
   const HYDRATE_PAGE_LIMIT = 200;
+
+  /* 个人版「今天」档 → 「近3天」：与企业版的 3d 档对齐。
+   * 个人版只有 今天 / 7天 / 30天 三档，企业版有 3d。平台不改，脚本补：
+   * ① 档位按钮文案换成「近3天」；② 请求体的 startTime 前移 2 天（平台区间只由
+   * startTime / endTime 决定，见 README §三的取证），于是表格与图表一起变成 3 天。
+   * 只改文案不改请求，按钮写「近3天」而表格只有 1 天，自相矛盾 —— 所以必须成对做。
+   * 设为 1 或更小即彻底关闭（恢复平台原生「今天」档）。
+   */
+  const PERSONAL_TODAY_DAYS = 3;
+  const PERSONAL_TODAY_LABEL = "近3天";
+  const PERSONAL_TODAY_RANGE_KEY = "3d";
 
   const NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 0,
@@ -269,7 +280,7 @@
     return diffDays <= 3 ? "hour" : "day";
   }
 
-  function alignRangeToLabel(uiState) {
+  function alignRangeToLabel(uiState, nowMs) {
     if (!ALIGN_RANGE_TO_LABEL || !uiState) {
       return uiState;
     }
@@ -284,7 +295,7 @@
     }
 
     const span = Math.round((startOfDay(end) - startOfDay(start)) / DAY_MS) + 1;
-    const endsToday = startOfDay(end) === startOfDay(Date.now());
+    const endsToday = startOfDay(end) === startOfDay(nowMs == null ? Date.now() : nowMs);
     if (span !== days + 1 || !endsToday) {
       return uiState;
     }
@@ -316,6 +327,72 @@
       return "";
     }
     return `明细覆盖不足，${stats.degraded} 天按汇总直取`;
+  }
+
+  /**
+   * 个人版「今天」档在脚本接管后等同于 3 天档：把档位键改写成 3d，
+   * 让粒度（按小时）、区间推算、截齐判断都走企业版 3d 的同一套逻辑。
+   */
+  function resolvePersonalTodayRangeKey(rangeKey, todayDays) {
+    const days = Number(todayDays == null ? PERSONAL_TODAY_DAYS : todayDays);
+    if (!(days > 1)) {
+      return rangeKey;
+    }
+    return rangeKey === "today" ? PERSONAL_TODAY_RANGE_KEY : rangeKey;
+  }
+
+  /** 按预设档位推算区间（含今天共 N 天），口径与档位标签一致 */
+  function presetDateRange(rangeKey, nowMs) {
+    const days = RANGE_LABEL_DAYS[rangeKey] || 0;
+    if (!days) {
+      return { startDate: "", endDate: "" };
+    }
+    const today = startOfDay(nowMs == null ? Date.now() : nowMs);
+    return {
+      startDate: formatDateOnly(today - (days - 1) * DAY_MS),
+      endDate: formatDateOnly(today),
+    };
+  }
+
+  /**
+   * 把「今天档」的请求区间扩成 N 天：平台区间的唯一来源就是请求体的
+   * startTime / endTime，而在请求层改写是唯一能让「表格 + 图表」同时对齐的办法
+   * （只改图表会让按钮与表格互相矛盾）。
+   * 只在请求区间恰为「今天 00:00:00 ~ 今天 23:59:59」时命中，其它档位与手动区间原样放过。
+   * @returns {string|null} 改写后的请求体；未命中返回 null
+   */
+  function rewriteTodayRequestRange(bodyText, nowMs, days) {
+    const span = Number(days == null ? PERSONAL_TODAY_DAYS : days);
+    if (!bodyText || typeof bodyText !== "string" || !(span > 1)) {
+      return null;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch (error) {
+      return null;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return null;
+    }
+    const startText = payload.startTime;
+    const endText = payload.endTime;
+    if (typeof startText !== "string" || typeof endText !== "string") {
+      return null;
+    }
+    const today = formatDateOnly(startOfDay(nowMs == null ? Date.now() : nowMs));
+    if (normalizeDateOnly(startText) !== today || normalizeDateOnly(endText) !== today) {
+      return null;
+    }
+    const preset = presetDateRange(PERSONAL_TODAY_RANGE_KEY, nowMs);
+    if (!preset.startDate) {
+      return null;
+    }
+    if (preset.startDate === today) {
+      return null;
+    }
+    payload.startTime = `${preset.startDate} ${String(startText).slice(11) || "00:00:00"}`;
+    return JSON.stringify(payload);
   }
 
   function buildSignature(startDate, endDate, rangeKey, unit) {
@@ -1049,6 +1126,7 @@
       eventName: PAYLOAD_EVENT,
       flag: BRIDGE_FLAG,
       skipHeader: HYDRATE_HEADER,
+      todayRewriteDays: PERSONAL_TODAY_DAYS,
     };
 
     const inPageContext = typeof unsafeWindow === "undefined";
@@ -1176,6 +1254,69 @@
         );
       };
 
+      /* ---- 个人版「今天」档 → 近 N 天：在请求层把区间前移 ----
+       * 平台只认请求体的 startTime / endTime，所以在请求层改写是唯一能让
+       * 「档位按钮 + 表格 + 图表」同时对齐的做法（只改图表会让按钮与表格互相矛盾）。
+       * 三重限定防误伤：① 当前选中的仍是 today 档；② 只动 usage/meter/bill 端点；
+       * ③ 请求区间恰为「今天 00:00 ~ 今天 23:59」。手动挑的单日区间同样会被改，
+       * 但那与「今天」档在请求上不可区分，且用户点「今天」本就是要 3 天。
+       */
+      const rewriteDays = Number(config.todayRewriteDays || 0);
+      const isTodayTabActive = () => {
+        try {
+          const input = document.querySelector(
+            ".request-usage-table__range-tabs .t-radio-button.t-is-checked input"
+          );
+          return Boolean(input && input.value === "today");
+        } catch (error) {
+          return false;
+        }
+      };
+      const pad2 = (value) => String(value).padStart(2, "0");
+      const dayText = (date) =>
+        `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+      const dayOfText = (text) => {
+        const match = String(text || "").match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+        return match ? `${match[1]}-${pad2(match[2])}-${pad2(match[3])}` : "";
+      };
+      const rewriteTodayBody = (body) => {
+        if (!(rewriteDays > 1) || typeof body !== "string" || !body) {
+          return null;
+        }
+        if (!isTodayTabActive()) {
+          return null;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(body);
+        } catch (error) {
+          return null;
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          return null;
+        }
+        const startText = payload.startTime;
+        const endText = payload.endTime;
+        if (typeof startText !== "string" || typeof endText !== "string") {
+          return null;
+        }
+        const today = dayText(new Date());
+        if (dayOfText(startText) !== today || dayOfText(endText) !== today) {
+          return null;
+        }
+        const start = new Date();
+        start.setDate(start.getDate() - (rewriteDays - 1));
+        payload.startTime = `${dayText(start)} ${String(startText).slice(11) || "00:00:00"}`;
+        try {
+          window.__CBUC_RANGE_REWRITES = (window.__CBUC_RANGE_REWRITES || 0) + 1;
+        } catch (error) {
+          // 诊断计数器失败不影响改写
+        }
+        return JSON.stringify(payload);
+      };
+      // 端点白名单：只碰用量/计费类接口，避免把别的 POST 也改了
+      const rewriteTarget = (url) => rewriteDays > 1 && /usage|meter|bill/i.test(url || "");
+
       const originalFetch = window.fetch;
       if (typeof originalFetch === "function") {
         window.fetch = function patchedFetch(input, init) {
@@ -1190,18 +1331,30 @@
           } catch (error) {
             headers = null;
           }
+          const skip = isOwnRequest(headers);
+
+          let effectiveInit = init;
+          if (!skip && rewriteTarget(url) && init && typeof init.body === "string") {
+            try {
+              const rewritten = rewriteTodayBody(init.body);
+              if (rewritten) {
+                effectiveInit = Object.assign({}, init, { body: rewritten });
+              }
+            } catch (error) {
+              effectiveInit = init;
+            }
+          }
 
           const meta = {
             channel: "fetch",
             url,
             method,
-            body: (init && normalizeBody(init.body)) || null,
+            body: (effectiveInit && normalizeBody(effectiveInit.body)) || null,
             headers,
             timestamp: Date.now(),
           };
-          const skip = isOwnRequest(headers);
 
-          return originalFetch.apply(this, arguments).then((response) => {
+          return originalFetch.call(this, input, effectiveInit).then((response) => {
             if (skip) {
               return response;
             }
@@ -1254,8 +1407,20 @@
       };
 
       XMLHttpRequest.prototype.send = function patchedSend(body) {
+        let effectiveBody = body;
+        if (this.__cbucMeta && !isOwnRequest(this.__cbucMeta.headers) &&
+          rewriteTarget(this.__cbucMeta.url)) {
+          try {
+            const rewritten = rewriteTodayBody(normalizeBody(body) || "");
+            if (rewritten) {
+              effectiveBody = rewritten;
+            }
+          } catch (error) {
+            effectiveBody = body;
+          }
+        }
         if (this.__cbucMeta) {
-          this.__cbucMeta.body = normalizeBody(body);
+          this.__cbucMeta.body = normalizeBody(effectiveBody);
         }
         this.addEventListener(
           "load",
@@ -1283,7 +1448,7 @@
           },
           { once: true }
         );
-        return originalSend.apply(this, arguments);
+        return originalSend.call(this, effectiveBody);
       };
     } catch (error) {
       console.warn("[CBUC] bridge init failed", error);
@@ -1823,12 +1988,55 @@
     return { parent: null, anchor: null };
   }
 
+  /**
+   * 个人版把「今天」档改写为「近3天」，与企业版 3d 档对齐。
+   * 只改文案会自相矛盾（按钮写近3天、表格只有 1 天），所以配套两件事：
+   * ① bridge 层把该档的请求区间前移 2 天（见 pageBridge）；② 这里同步档位文案与区间文本。
+   * React 重渲染不会还原 label（实测切换档位后仍在），日期文本则会随档位重渲染被覆盖，
+   * 故每次 sync 幂等校正一次（字符串相同就不写 DOM，不会触发重排）。
+   */
+  function ensurePlansRangeTabs(usageRoot) {
+    if (!(PERSONAL_TODAY_DAYS > 1) || !usageRoot) {
+      return;
+    }
+    const tabs = usageRoot.querySelector(".request-usage-table__range-tabs");
+    if (!tabs) {
+      return;
+    }
+    const todayButton = Array.from(tabs.querySelectorAll(".t-radio-button")).find((button) => {
+      const input = button.querySelector("input");
+      return Boolean(input && input.value === "today");
+    });
+    if (!todayButton) {
+      return;
+    }
+    const label = todayButton.querySelector(".t-radio-button__label");
+    if (label && label.textContent !== PERSONAL_TODAY_LABEL) {
+      label.textContent = PERSONAL_TODAY_LABEL;
+    }
+    if (todayButton.getAttribute("data-cbuc-range") !== PERSONAL_TODAY_RANGE_KEY) {
+      todayButton.setAttribute("data-cbuc-range", PERSONAL_TODAY_RANGE_KEY);
+    }
+    if (!todayButton.classList.contains("t-is-checked")) {
+      return;
+    }
+    const preset = presetDateRange(PERSONAL_TODAY_RANGE_KEY);
+    const textNode = usageRoot.querySelector(".request-usage-table__date-range-text");
+    if (!preset.startDate || !textNode) {
+      return;
+    }
+    const next = `${preset.startDate} - ${preset.endDate}`;
+    if (textNode.textContent !== next) {
+      textNode.textContent = next;
+    }
+  }
+
   function readPlansUi(usageRoot) {
     const checkedInput = usageRoot.querySelector(".t-radio-button.t-is-checked input");
     const checkedLabel = usageRoot.querySelector(
       ".t-radio-button.t-is-checked .t-radio-button__label"
     );
-    const rangeKey = (
+    const rawRangeKey = (
       (checkedInput && checkedInput.value) ||
       (checkedLabel && checkedLabel.textContent) ||
       ""
@@ -1836,13 +2044,30 @@
       .trim()
       .toLowerCase();
 
+    // 「今天」档已被脚本接管成近3天：档位键按 3d 处理（粒度走按小时、区间按 3 天）
+    const rangeKey = resolvePersonalTodayRangeKey(rawRangeKey);
+    const overridden = rangeKey !== rawRangeKey;
+
     const rangeText = usageRoot.querySelector(".request-usage-table__date-range-text");
     const rangeValue = rangeText ? rangeText.textContent || "" : "";
     const dateMatch = rangeValue.match(
       /(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*[-–—~]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})/
     );
-    const startDate = dateMatch ? normalizeDateOnly(dateMatch[1]) : "";
-    const endDate = dateMatch ? normalizeDateOnly(dateMatch[2]) : "";
+    let startDate = dateMatch ? normalizeDateOnly(dateMatch[1]) : "";
+    let endDate = dateMatch ? normalizeDateOnly(dateMatch[2]) : "";
+
+    // 平台对「今天」档只发单日区间，改造后必须按档位自己推区间，
+    // 否则图表仍只画一天。手动挑的区间不受影响（此时文本不是单日今天）。
+    if (overridden) {
+      const todayText = formatDateOnly(startOfDay(Date.now()));
+      const platformSingleToday =
+        Boolean(startDate) && startDate === endDate && startDate === todayText;
+      if (platformSingleToday || !startDate || !endDate) {
+        const preset = presetDateRange(rangeKey);
+        startDate = preset.startDate;
+        endDate = preset.endDate;
+      }
+    }
 
     return {
       rangeKey,
@@ -2036,13 +2261,7 @@
       }
     }
     // 兜底：读不到日期控件时按档位推算（与标签口径一致，含今天共 N 天）
-    const days = RANGE_LABEL_DAYS[rangeKey] || 0;
-    if (!days) {
-      return { startDate: "", endDate: "" };
-    }
-    const today = startOfDay(Date.now());
-    const start = today - (days - 1) * DAY_MS;
-    return { startDate: formatDateOnly(start), endDate: formatDateOnly(today) };
+    return presetDateRange(rangeKey);
   }
 
   function parseEnterpriseRows(dashboard) {
@@ -2184,6 +2403,11 @@
     state.adapterId = adapter.id;
     state.usageRoot = section;
     mountInto(section, adapter);
+
+    // 个人版「今天」→「近3天」的界面侧改造（请求侧改写见 pageBridge）
+    if (adapter.id === "plans") {
+      ensurePlansRangeTabs(section);
+    }
 
     const uiState = alignRangeToLabel(adapter.readUi(section));
     const signature = getStateSignature(uiState);

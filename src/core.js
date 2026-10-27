@@ -15,6 +15,17 @@
   // 补数页数安全阀
   const HYDRATE_PAGE_LIMIT = 200;
 
+  /* 个人版「今天」档 → 「近3天」：与企业版的 3d 档对齐。
+   * 个人版只有 今天 / 7天 / 30天 三档，企业版有 3d。平台不改，脚本补：
+   * ① 档位按钮文案换成「近3天」；② 请求体的 startTime 前移 2 天（平台区间只由
+   * startTime / endTime 决定，见 README §三的取证），于是表格与图表一起变成 3 天。
+   * 只改文案不改请求，按钮写「近3天」而表格只有 1 天，自相矛盾 —— 所以必须成对做。
+   * 设为 1 或更小即彻底关闭（恢复平台原生「今天」档）。
+   */
+  const PERSONAL_TODAY_DAYS = 3;
+  const PERSONAL_TODAY_LABEL = "近3天";
+  const PERSONAL_TODAY_RANGE_KEY = "3d";
+
   const NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 0,
     maximumFractionDigits: 2,
@@ -247,7 +258,7 @@
     return diffDays <= 3 ? "hour" : "day";
   }
 
-  function alignRangeToLabel(uiState) {
+  function alignRangeToLabel(uiState, nowMs) {
     if (!ALIGN_RANGE_TO_LABEL || !uiState) {
       return uiState;
     }
@@ -262,7 +273,7 @@
     }
 
     const span = Math.round((startOfDay(end) - startOfDay(start)) / DAY_MS) + 1;
-    const endsToday = startOfDay(end) === startOfDay(Date.now());
+    const endsToday = startOfDay(end) === startOfDay(nowMs == null ? Date.now() : nowMs);
     if (span !== days + 1 || !endsToday) {
       return uiState;
     }
@@ -294,6 +305,72 @@
       return "";
     }
     return `明细覆盖不足，${stats.degraded} 天按汇总直取`;
+  }
+
+  /**
+   * 个人版「今天」档在脚本接管后等同于 3 天档：把档位键改写成 3d，
+   * 让粒度（按小时）、区间推算、截齐判断都走企业版 3d 的同一套逻辑。
+   */
+  function resolvePersonalTodayRangeKey(rangeKey, todayDays) {
+    const days = Number(todayDays == null ? PERSONAL_TODAY_DAYS : todayDays);
+    if (!(days > 1)) {
+      return rangeKey;
+    }
+    return rangeKey === "today" ? PERSONAL_TODAY_RANGE_KEY : rangeKey;
+  }
+
+  /** 按预设档位推算区间（含今天共 N 天），口径与档位标签一致 */
+  function presetDateRange(rangeKey, nowMs) {
+    const days = RANGE_LABEL_DAYS[rangeKey] || 0;
+    if (!days) {
+      return { startDate: "", endDate: "" };
+    }
+    const today = startOfDay(nowMs == null ? Date.now() : nowMs);
+    return {
+      startDate: formatDateOnly(today - (days - 1) * DAY_MS),
+      endDate: formatDateOnly(today),
+    };
+  }
+
+  /**
+   * 把「今天档」的请求区间扩成 N 天：平台区间的唯一来源就是请求体的
+   * startTime / endTime，而在请求层改写是唯一能让「表格 + 图表」同时对齐的办法
+   * （只改图表会让按钮与表格互相矛盾）。
+   * 只在请求区间恰为「今天 00:00:00 ~ 今天 23:59:59」时命中，其它档位与手动区间原样放过。
+   * @returns {string|null} 改写后的请求体；未命中返回 null
+   */
+  function rewriteTodayRequestRange(bodyText, nowMs, days) {
+    const span = Number(days == null ? PERSONAL_TODAY_DAYS : days);
+    if (!bodyText || typeof bodyText !== "string" || !(span > 1)) {
+      return null;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch (error) {
+      return null;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return null;
+    }
+    const startText = payload.startTime;
+    const endText = payload.endTime;
+    if (typeof startText !== "string" || typeof endText !== "string") {
+      return null;
+    }
+    const today = formatDateOnly(startOfDay(nowMs == null ? Date.now() : nowMs));
+    if (normalizeDateOnly(startText) !== today || normalizeDateOnly(endText) !== today) {
+      return null;
+    }
+    const preset = presetDateRange(PERSONAL_TODAY_RANGE_KEY, nowMs);
+    if (!preset.startDate) {
+      return null;
+    }
+    if (preset.startDate === today) {
+      return null;
+    }
+    payload.startTime = `${preset.startDate} ${String(startText).slice(11) || "00:00:00"}`;
+    return JSON.stringify(payload);
   }
 
   function buildSignature(startDate, endDate, rangeKey, unit) {
@@ -890,6 +967,12 @@ export {
   ALIGN_RANGE_TO_LABEL,
   RANGE_LABEL_DAYS,
   HYDRATE_PAGE_LIMIT,
+  PERSONAL_TODAY_DAYS,
+  PERSONAL_TODAY_LABEL,
+  PERSONAL_TODAY_RANGE_KEY,
+  resolvePersonalTodayRangeKey,
+  presetDateRange,
+  rewriteTodayRequestRange,
   NUMBER_FORMATTER,
   DATETIME_TEXT_RE,
   NUMERIC_TEXT_RE,
