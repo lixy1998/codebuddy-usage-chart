@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         CodeBuddy / WorkBuddy Usage Credit Chart
 // @namespace    https://github.com/lixy1998/codebuddy-usage-chart
-// @version      0.7.0
+// @version      0.7.1
 // @description  Add a credit usage chart above the usage tables of CodeBuddy / WorkBuddy (personal & enterprise).
 // @license      MIT
 // @author       lixy1998
 // @match        https://www.codebuddy.cn/profile/plans-usage*
+// @match        https://www.codebuddy.cn/profile/usage*
 // @match        https://www.workbuddy.cn/profile/plans-usage*
 // @match        https://www.workbuddy.cn/profile/usage*
 // @run-at       document-start
@@ -895,6 +896,28 @@
    * 按区间把记录切成时间桶并汇总模型占比。
    * 纯计算：颜色由 colorFn 注入，便于在 node 里直接测试分桶边界。
    */
+  /** 区间的自然日数（含首尾） */
+  function dateSpanDays(startDate, endDate) {
+    const start = parseDateOnly(startDate);
+    const end = parseDateOnly(endDate);
+    if (!start || !end) {
+      return 0;
+    }
+    return Math.round((startOfDay(end) - startOfDay(start)) / DAY_MS) + 1;
+  }
+
+  /**
+   * 用跨度反推预设档位。平台固定多算一天（7天档给 8 个自然日），
+   * 只认 1/4/8/31 三种预设跨度 + 今天，避免把手选区间误当预设档。
+   */
+  function inferPresetRangeKey(spanDays) {
+    const span = Number(spanDays);
+    if (!Number.isFinite(span)) {
+      return "";
+    }
+    return { 1: "today", 4: "3d", 8: "7d", 31: "30d" }[span] || "";
+  }
+
   /**
    * 决定实际绘制粒度：按小时画超宽区间会产生上千个柱子（SVG 节点爆炸、也看不清），
    * 超过 maxBuckets 就退回按天。
@@ -1050,6 +1073,7 @@
     lastDataFingerprint: "",
     lastRenderWidth: 0,
     lastPayloadHash: "",
+    rangeRetry: 0,
 
     resizeObserver: null,
     mutationObserver: null,
@@ -2031,9 +2055,44 @@
     }
   }
 
+  /**
+   * 个人版新版（buddy-one 版式）把筛选条移出了表格容器：
+   *   .buddy-one-credit-package-card > [tabs, .buddy-one-detail-toolbar, .request-usage-table--plans-usage]
+   * 表格容器里只剩表头表体，档位与日期都在兄弟节点里。
+   * 旧版式没有这个包装层，closest 会落到 usageRoot 自己，行为不变。
+   */
+  function findPlansFilterScope(usageRoot) {
+    if (!usageRoot) {
+      return null;
+    }
+    return (
+      usageRoot.closest(".buddy-one-credit-package-card") ||
+      usageRoot.closest(".buddy-one-detail") ||
+      usageRoot
+    );
+  }
+
+  /** 日期区间：优先读日期选择器的输入值（新旧版式都受控于它），文本正则只作兜底 */
+  function readDateRangeInputs(scope) {
+    if (!scope) {
+      return { startDate: "", endDate: "" };
+    }
+    const pickers = Array.from(scope.querySelectorAll(".t-date-range-picker, .t-range-input"));
+    for (const picker of pickers) {
+      const values = Array.from(picker.querySelectorAll("input"))
+        .map((input) => normalizeDateOnly(input.value || input.getAttribute("value") || ""))
+        .filter(Boolean);
+      if (values.length >= 2) {
+        return { startDate: values[0], endDate: values[values.length - 1] };
+      }
+    }
+    return { startDate: "", endDate: "" };
+  }
+
   function readPlansUi(usageRoot) {
-    const checkedInput = usageRoot.querySelector(".t-radio-button.t-is-checked input");
-    const checkedLabel = usageRoot.querySelector(
+    const scope = findPlansFilterScope(usageRoot) || usageRoot;
+    const checkedInput = scope.querySelector(".t-radio-button.t-is-checked input");
+    const checkedLabel = scope.querySelector(
       ".t-radio-button.t-is-checked .t-radio-button__label"
     );
     const rawRangeKey = (
@@ -2044,17 +2103,28 @@
       .trim()
       .toLowerCase();
 
-    // 「今天」档已被脚本接管成近3天：档位键按 3d 处理（粒度走按小时、区间按 3 天）
-    const rangeKey = resolvePersonalTodayRangeKey(rawRangeKey);
+    // 「今天」档被接管成近3天，前提是页面结构支持同步改写（旧版有 range-tabs 容器：
+    // 文案与请求都能一起改）。新版 buddy-one 版把筛选条挪走了，只改图表会造成
+    // 「按钮写今天、表格是今天、图表是 3 天」的自相矛盾，故新版按原样走。
+    const canOverrideToday = Boolean(scope.querySelector(".request-usage-table__range-tabs"));
+    const rangeKey = canOverrideToday
+      ? resolvePersonalTodayRangeKey(rawRangeKey)
+      : rawRangeKey;
     const overridden = rangeKey !== rawRangeKey;
 
-    const rangeText = usageRoot.querySelector(".request-usage-table__date-range-text");
-    const rangeValue = rangeText ? rangeText.textContent || "" : "";
-    const dateMatch = rangeValue.match(
-      /(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*[-–—~]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})/
-    );
-    let startDate = dateMatch ? normalizeDateOnly(dateMatch[1]) : "";
-    let endDate = dateMatch ? normalizeDateOnly(dateMatch[2]) : "";
+    const picked = readDateRangeInputs(scope);
+    let startDate = picked.startDate;
+    let endDate = picked.endDate;
+
+    if (!startDate || !endDate) {
+      const rangeText = scope.querySelector(".request-usage-table__date-range-text");
+      const rangeValue = rangeText ? rangeText.textContent || "" : "";
+      const dateMatch = rangeValue.match(
+        /(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*[-–—~]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})/
+      );
+      startDate = dateMatch ? normalizeDateOnly(dateMatch[1]) : "";
+      endDate = dateMatch ? normalizeDateOnly(dateMatch[2]) : "";
+    }
 
     // 平台对「今天」档只发单日区间，改造后必须按档位自己推区间，
     // 否则图表仍只画一天。手动挑的区间不受影响（此时文本不是单日今天）。
@@ -2411,6 +2481,22 @@
 
     const uiState = alignRangeToLabel(adapter.readUi(section));
     const signature = getStateSignature(uiState);
+    // 表格已经有行、却读不到日期区间 —— 多半是 React 正在重渲染（切 tab / 切档位的中间态）。
+    // 此时若照常渲染空态，空态会被写进指纹固化，之后页面静止就再也不会恢复。
+    const rangeMissing = !uiState.startDate || !uiState.endDate;
+    if (rangeMissing) {
+      state.rangeRetry += 1;
+      if (state.rangeRetry <= 8) {
+        debugLog("range.retry", { attempt: state.rangeRetry, rows: uiState.tableRecords.length });
+        state.lastUiFingerprint = "";
+        renderLoadingState("正在读取用量区间...");
+        scheduleSync("range-retry", 350);
+        return;
+      }
+    } else {
+      state.rangeRetry = 0;
+    }
+
     // 轻量指纹：这里在每次 DOM 变动后都会重算，用字符串拼接代替 JSON.stringify
     const uiFingerprint = [
       signature,
@@ -2957,7 +3043,14 @@
     }
 
     // 同一批数据重复推送（React 双请求、翻页重放）直接跳过
-    const hash = `${meta && meta.url}|${fingerprintRecords(extracted.records)}`;
+    const hinted = extractRangeHint(meta);
+    const hash = [
+      meta && meta.url,
+      hinted.startDate,
+      hinted.endDate,
+      extracted.total,
+      fingerprintRecords(extracted.records),
+    ].join("|");
     if (hash === state.lastPayloadHash) {
       return;
     }
@@ -2998,7 +3091,19 @@
     const tableRecords = uiState.tableRecords;
     const cachedRecords = getCachedRecordsForUiState(uiState);
     const expected = getExpectedCount(dataset, uiState);
-    const isComplete = Boolean(expected && cachedRecords.length >= expected);
+    const isComplete = Boolean(
+      (dataset && dataset.allPagesFetched) ||
+        (expected && cachedRecords.length >= expected * 0.9)
+    );
+    debugLog("source.choose", {
+      expected,
+      cached: cachedRecords.length,
+      complete: isComplete,
+      fetched: Boolean(dataset && dataset.allPagesFetched),
+      totalExpected: dataset ? dataset.totalExpected : null,
+      datasetKey: signature,
+      adjusted: uiState.rangeAdjusted || null,
+    });
 
     const tableSource = tableRecords.length
       ? {
@@ -3015,9 +3120,7 @@
         status: "ready",
         records: cachedRecords,
         label: "缓存命中（已完整）",
-        meta: expected
-          ? `已复用 ${cachedRecords.length}/${expected} 条记录`
-          : `${cachedRecords.length} 条缓存记录`,
+        meta: `已复用 ${cachedRecords.length} 条记录`,
         fingerprint: `cache-full:${fingerprintRecords(cachedRecords)}`,
       };
     }
@@ -3027,9 +3130,7 @@
         status: "ready",
         records: cachedRecords,
         label: "缓存命中（部分覆盖）",
-        meta: expected
-          ? `已复用 ${cachedRecords.length}/${expected} 条记录`
-          : `已复用 ${cachedRecords.length} 条缓存记录`,
+        meta: `已复用 ${cachedRecords.length} 条记录（补数中）`,
         fingerprint: `cache-partial:${fingerprintRecords(cachedRecords)}`,
       };
     }
@@ -3042,14 +3143,26 @@
     for (const record of extracted.records) {
       existing.recordIds.add(record.requestId);
     }
+    // 总条数以「该响应自己的 total」为准：切档瞬间页面分页文案还是上一档的
+    // （实测 7 天档被写成 1042 条），取最大值会把上一档的总数固化进来。
     if (Number.isFinite(extracted.total) && extracted.total > 0) {
-      existing.totalExpected = Math.max(existing.totalExpected || 0, extracted.total);
-    }
-    if (Number.isFinite(uiState.totalCount) && uiState.totalCount > 0) {
-      existing.totalExpected = Math.max(existing.totalExpected || 0, uiState.totalCount);
+      existing.totalExpected = extracted.total;
+    } else if (
+      !Number.isFinite(existing.totalExpected) &&
+      uiState &&
+      Number.isFinite(uiState.totalCount) &&
+      uiState.totalCount > 0
+    ) {
+      existing.totalExpected = uiState.totalCount;
     }
     existing.lastSeenAt = Date.now();
     state.datasets.set(signature, existing);
+    debugLog("dataset.upsert", {
+      signature,
+      incomingTotal: Number.isFinite(extracted.total) ? extracted.total : null,
+      totalExpected: existing.totalExpected,
+      tableTotal: uiState && uiState.totalCount,
+    });
   }
 
   function ensureRangeDataset(signature, uiState) {
@@ -3066,8 +3179,13 @@
     existing.startDate = parsed.startDate || existing.startDate || "";
     existing.endDate = parsed.endDate || existing.endDate || "";
     existing.unit = parsed.unit || existing.unit || "day";
-    if (uiState && Number.isFinite(uiState.totalCount) && uiState.totalCount > 0) {
-      existing.totalExpected = Math.max(existing.totalExpected || 0, uiState.totalCount);
+    if (
+      !Number.isFinite(existing.totalExpected) &&
+      uiState &&
+      Number.isFinite(uiState.totalCount) &&
+      uiState.totalCount > 0
+    ) {
+      existing.totalExpected = uiState.totalCount;
     }
     state.datasets.set(signature, existing);
     return existing;
@@ -3078,25 +3196,45 @@
     if (!dataset) {
       return;
     }
-    const expected = getExpectedCount(dataset, uiState, extracted);
-    const cachedCount = getCachedRecordsForDataset(dataset).length;
-    if (!Number.isFinite(expected) || expected <= cachedCount) {
+    if (dataset.allPagesFetched) {
       return;
     }
+
+    const cachedCount = getCachedRecordsForDataset(dataset).length;
+    // 分页必须按平台给的原始总数算：页是「平台窗口」的页（如 7 天档实为 8 天、191 条），
+    // 按天数折算出的条数（167）只用于展示。拿折算值算页数会少拉，进而误判「部分覆盖」。
+    const rawTotal = Number.isFinite(extracted && extracted.total)
+      ? extracted.total
+      : dataset.totalExpected;
+
+    if (!Number.isFinite(rawTotal)) {
+      // 拿不到总条数（payload 只给了第一页）：不标记，等下一次 payload 再试
+      return;
+    }
+    if (rawTotal <= cachedCount) {
+      dataset.allPagesFetched = true;
+      return;
+    }
+
     const existingJob = state.hydrationJobs.get(signature);
     if (existingJob && existingJob.running) {
       return;
     }
 
-    const plan = derivePaginationPlan(meta, expected);
+    const plan = derivePaginationPlan(meta, rawTotal);
     if (!plan) {
+      dataset.allPagesFetched = true;
       return;
     }
 
-    const job = { running: true, plan, pages: new Set() };
+    const job = { running: true, plan, pages: new Set(), failed: 0 };
     state.hydrationJobs.set(signature, job);
     void fetchRemainingPages(signature, job).finally(() => {
       job.running = false;
+      // 只有全部页都取回才算「拉全」；有失败页则留待下次 payload 重试
+      if (!job.failed) {
+        dataset.allPagesFetched = true;
+      }
       state.lastUiFingerprint = "";
       scheduleSync("hydrate", 0);
     });
@@ -3145,6 +3283,7 @@
           upsertDataset(signature, extracted, { totalCount: null });
           scheduleSync("hydrate-page");
         } catch (error) {
+          job.failed += 1;
           console.warn("[CBUC] hydrate page failed", error);
         }
       }
@@ -3782,28 +3921,36 @@
    * 范围与签名
    * ------------------------------------------------------------------ */
 
+  /**
+   * 响应该落到哪个区间：**以请求体里的区间为准**，而不是当前 UI。
+   * 切换档位时上一档的响应往往比 UI 更晚到，若按 UI 取签名，
+   * 30 天的总数会被记到 7 天档名下（实测就是这里串的档）。
+   * 请求区间先按标签口径截齐，再与 sync 的 signature 对齐。
+   */
   function resolveSignature(meta, extracted, uiState) {
     const hinted = extractRangeHint(meta);
-    // UI 优先：uiState 已按标签口径截齐，若让请求体里的日期（平台原始窗口）优先，
-    // 同一档位会算出两个 signature，缓存与聚合范围就对不上了。
+    const span = dateSpanDays(hinted.startDate, hinted.endDate);
+    if (hinted.startDate && hinted.endDate && span > 0) {
+      const rangeKey = hinted.rangeKey || inferPresetRangeKey(span);
+      const aligned = alignRangeToLabel({
+        startDate: hinted.startDate,
+        endDate: hinted.endDate,
+        rangeKey,
+        unit: determineUnit(rangeKey, hinted.startDate, hinted.endDate),
+      });
+      const key =
+        inferPresetRangeKey(dateSpanDays(aligned.startDate, aligned.endDate)) || rangeKey;
+      return buildSignature(
+        aligned.startDate,
+        aligned.endDate,
+        key,
+        determineUnit(key, aligned.startDate, aligned.endDate)
+      );
+    }
     if (uiState && (uiState.startDate || uiState.endDate)) {
       return getStateSignature(uiState);
     }
-    const startDate = hinted.startDate || "";
-    const endDate = hinted.endDate || "";
-    const rangeKey = hinted.rangeKey || "";
-    const aligned = alignRangeToLabel({
-      startDate,
-      endDate,
-      rangeKey,
-      unit: determineUnit(rangeKey, startDate, endDate),
-    });
-    return buildSignature(
-      aligned.startDate,
-      aligned.endDate,
-      rangeKey,
-      determineUnit(rangeKey, aligned.startDate, aligned.endDate)
-    );
+    return "na|na|custom|day";
   }
 
 

@@ -24,6 +24,8 @@ import {
   extractRangeHint,
   calibrateSeries,
   describeCalibration,
+  dateSpanDays,
+  inferPresetRangeKey,
   resolveGranularity,
   bucketizeRecords,
   getExpectedCount,
@@ -343,4 +345,19 @@ test("粒度降级：桶数超阈值时按小时退回按天", () => {
 
   const dayUnit = resolveGranularity({ startDate: "2026-10-19", endDate: "2026-10-26" }, "day", 240);
   assert.equal(dayUnit.unit, "day");
+});
+
+test("区间跨度与档位反推（平台固定多算一天）", () => {
+  assert.equal(dateSpanDays("2026-10-21", "2026-10-28"), 8);
+  assert.equal(dateSpanDays("2026-10-26", "2026-10-26"), 1);
+  assert.equal(dateSpanDays("", "2026-10-28"), 0);
+
+  // 8 天 → 7 天档、4 天 → 3 天档、31 天 → 30 天档
+  assert.equal(inferPresetRangeKey(8), "7d");
+  assert.equal(inferPresetRangeKey(4), "3d");
+  assert.equal(inferPresetRangeKey(31), "30d");
+  assert.equal(inferPresetRangeKey(1), "today");
+  // 非预设跨度不猜（手选区间不能被当作预设档去截齐）
+  assert.equal(inferPresetRangeKey(10), "");
+  assert.equal(inferPresetRangeKey(0), "");
 });

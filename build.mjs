@@ -20,6 +20,7 @@ const HEADER = `// ==UserScript==
 // @license      MIT
 // @author       lixy1998
 // @match        https://www.codebuddy.cn/profile/plans-usage*
+// @match        https://www.codebuddy.cn/profile/usage*
 // @match        https://www.workbuddy.cn/profile/plans-usage*
 // @match        https://www.workbuddy.cn/profile/usage*
 // @run-at       document-start

@@ -873,6 +873,28 @@
    * 按区间把记录切成时间桶并汇总模型占比。
    * 纯计算：颜色由 colorFn 注入，便于在 node 里直接测试分桶边界。
    */
+  /** 区间的自然日数（含首尾） */
+  function dateSpanDays(startDate, endDate) {
+    const start = parseDateOnly(startDate);
+    const end = parseDateOnly(endDate);
+    if (!start || !end) {
+      return 0;
+    }
+    return Math.round((startOfDay(end) - startOfDay(start)) / DAY_MS) + 1;
+  }
+
+  /**
+   * 用跨度反推预设档位。平台固定多算一天（7天档给 8 个自然日），
+   * 只认 1/4/8/31 三种预设跨度 + 今天，避免把手选区间误当预设档。
+   */
+  function inferPresetRangeKey(spanDays) {
+    const span = Number(spanDays);
+    if (!Number.isFinite(span)) {
+      return "";
+    }
+    return { 1: "today", 4: "3d", 8: "7d", 31: "30d" }[span] || "";
+  }
+
   /**
    * 决定实际绘制粒度：按小时画超宽区间会产生上千个柱子（SVG 节点爆炸、也看不清），
    * 超过 maxBuckets 就退回按天。
@@ -1024,6 +1046,8 @@ export {
   decodeTooltipBreakdown,
   buildTooltipBreakdownHtml,
   getExpectedCount,
+  dateSpanDays,
+  inferPresetRangeKey,
   resolveGranularity,
   bucketizeRecords,
 };
